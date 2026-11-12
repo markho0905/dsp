@@ -282,19 +282,30 @@ class AdvancedDialog(QDialog):
         self.head = dsp(0, 12, s["headroom"], " dB", 0.5)
         self.align = QCheckBox("左右時間對齊")
         self.align.setChecked(bool(s["align"]))
+        self.mimo_fmax = dsp(60, 300, s.get("mimo_fmax", 150.0), " Hz", 10)
+        self.mimo_sup = dsp(0, 100, 100 * float(s.get("mimo_support", 1.0)), " %", 10)
+        self.mimo_mode = QComboBox()
+        self.mimo_mode.addItem("空間一致（只修每個位置的幅度，較保守）", "space")
+        self.mimo_mode.addItem("餘音控制（也抵消低頻餘音，Dirac ART 式）", "decay")
+        self.mimo_mode.setCurrentIndex(1 if s.get("mimo_mode", "space") == "decay" else 0)
         f.addRow("混合相位的濾波器延遲", self.delay)
         f.addRow("相位修正上限（0＝關；可到 20 kHz）", self.pfmax)
         f.addRow("避免填深谷（0＝關）", self.dip)
         f.addRow("預振鈴上限（需小於延遲）", self.pre)
         f.addRow("預留餘量", self.head)
         f.addRow("", self.align)
+        f.addRow("MIMO 支援喇叭頻率上限", self.mimo_fmax)
+        f.addRow("MIMO 支援強度", self.mimo_sup)
+        f.addRow("MIMO 模式", self.mimo_mode)
         ok = GradientButton("完成")
         ok.clicked.connect(self.accept)
         f.addRow(ok)
 
     def accept(self):
         self.win.update_many(dict(delay_ms=self.delay.value(), phase_fmax=self.pfmax.value(), dip=self.dip.value(),
-                                  pre_ms=self.pre.value(), headroom=self.head.value(), align=self.align.isChecked()))
+                                  pre_ms=self.pre.value(), headroom=self.head.value(), align=self.align.isChecked(),
+                                  mimo_fmax=self.mimo_fmax.value(), mimo_support=self.mimo_sup.value() / 100.0,
+                                  mimo_mode=self.mimo_mode.currentData()))
         super().accept()
 
 
@@ -714,6 +725,23 @@ class MainWindow(QMainWindow):
             outs.append(dict(name=o["name"], channel=o["channel"], paths=paths))
         return Profile("試聽 FIR", None, None, fs, outputs=outs)
 
+    def design_outputs(self, ds, fs_from, fs_to):
+        """Engine output set for a design result: L/R own filters plus, for a MIMO design, the support path from the
+        other source channel (input index 0 = L programme, 1 = R programme)."""
+        rs = lambda h: self._resample(np.asarray(h, float), fs_from, fs_to)
+        hx = getattr(ds, "hx", None) or {}
+        outs = []
+        for i, c in enumerate("LR"):
+            oth = "R" if c == "L" else "L"
+            paths = [(i, rs(ds.h[c]), 1.0)]
+            if (oth + c) in hx:
+                paths.append((1 - i, rs(hx[oth + c]), 1.0))
+            outs.append(dict(name=c, channel=i, paths=paths))
+        return outs
+
+    def design_profile(self, ds, fs_from, fs_to, name):
+        return Profile(name, None, None, fs_to, outputs=self.design_outputs(ds, fs_from, fs_to))
+
     def set_preview(self, on, bypass=False):
         """Export page: play the currently designed (not yet saved) filter through the engine."""
         ds, an = self.design_result, self.analysis
@@ -722,8 +750,7 @@ class MainWindow(QMainWindow):
             self.apply_selection()
             return
         fs = self.audio_rate()
-        hl, hr = (self._resample(np.asarray(ds.h[c], float), an.fs, fs) for c in "LR")
-        self.preview_prof = None if bypass else Profile("預覽", hl, hr, fs)
+        self.preview_prof = None if bypass else self.design_profile(ds, an.fs, fs, "預覽")
         self.preview_bypass = bypass
         if not self.engine.running and not self.measuring:
             self.start_audio()
@@ -1059,6 +1086,9 @@ class MainWindow(QMainWindow):
     def export_file_names(self):
         pre = {"std": "std", "night": "night", "movie": "movie"}[self.slot]
         names = [f"{pre}_L.wav", f"{pre}_R.wav"]
+        ds = getattr(self, "design_result", None)
+        if ds is not None and getattr(ds, "hx", None):
+            names += [f"{pre}_L_fromR.wav", f"{pre}_R_fromL.wav"]
         bp = self.pages.get("bass") if hasattr(self, "pages") else None
         if bp is not None and bp.applied:
             names += [f"{pre}_{nm}.wav" for nm, _ in bp.applied["G"]]
@@ -1115,23 +1145,37 @@ class MainWindow(QMainWindow):
         pre = {"std": "std", "night": "night", "movie": "movie"}[self.slot]
         outs, info = None, None
         bp = self.pages["bass"]
+        hx = getattr(ds, "hx", None) or {}
         if bp.applied:
-            main_h = {c: ds.h[c] / ds.scale for c in "LR"} if self.bass_cfg["main"] == "design" else None
+            main_h = None
+            if self.bass_cfg["main"] == "design":
+                main_h = {c: ds.h[c] / ds.scale for c in "LR"}
+                main_h.update({k: v / ds.scale for k, v in hx.items()})
             outs, info = bp.build_outputs(main_h, int(s["taps"]))
-            n = 1 << 17
-            from scipy.fft import rfft
-            mx = max(float(np.abs(sum(rfft(o["h"], n) * g for _, g in o["paths"])).max()) for o in outs)
-            sc = min(1.0, 10 ** (-1.0 / 20) / mx)
+            sc = min(1.0, 10 ** (-1.0 / 20) / D.output_peak_gain(outs))
+            D.scale_outputs(outs, sc)
+            files = {}
             for o in outs:
-                o["h"] = o["h"] * sc
-            files = {f"{pre}_{o['name']}.wav": o["h"] for o in outs}
+                files[f"{pre}_{o['name']}.wav"] = o["h"]
+                for pth in o["paths"]:
+                    if len(pth) >= 4:
+                        files[f"{pre}_{o['name']}{pth[3]}.wav"] = pth[2]
         else:
             files = {f"{pre}_L.wav": ds.h["L"], f"{pre}_R.wav": ds.h["R"]}
+            if "RL" in hx:
+                files[f"{pre}_L_fromR.wav"] = hx["RL"]          # right programme -> left speaker (support)
+            if "LR" in hx:
+                files[f"{pre}_R_fromL.wav"] = hx["LR"]          # left programme -> right speaker (support)
+            if hx:
+                outs = [dict(name="L", channel=1, h=ds.h["L"], paths=[(0, 1.0)] + ([(1, 1.0, hx["RL"], "_fromR")] if "RL" in hx else [])),
+                        dict(name="R", channel=2, h=ds.h["R"], paths=[(1, 1.0)] + ([(0, 1.0, hx["LR"], "_fromL")] if "LR" in hx else []))]
         out_fs = int(s["out_fs"])
         folder = self.export_cfg["folder"]
         exist = [n for n in files if os.path.exists(os.path.join(folder, n))]
         if self.export_cfg["ask"] and not quiet:
             txt = f"將寫入資料夾：\n{folder}\n\n" + "\n".join(files) + f"\n\n取樣率 {out_fs / 1000:g} kHz；同一組濾波器也會存成「{self.slot_name()}」設定檔。"
+            if hx:
+                txt += "\n（MIMO：_fromL／_fromR 是另一聲道送到這顆喇叭的支援濾波器，外部卷積器需以 2×2 矩陣載入。）"
             if exist:
                 txt += "\n\n⚠ 以下檔案已存在，會被覆蓋：\n" + "\n".join(exist)
             if QMessageBox.question(self, "確認儲存", txt) != QMessageBox.Yes:

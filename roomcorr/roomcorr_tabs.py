@@ -264,7 +264,7 @@ class FirToolTab(QWidget):
             self.seg_src.set_value("chain")
             self.b_opt.setEnabled(False)
             return
-        self.model = FO.Model(an, ds.h, ds.tgt_rel, self.fs(), fmax=float(w.cur["fmax"]))
+        self.model = FO.Model(an, ds.h, ds.tgt_rel, self.fs(), fmax=float(w.cur["fmax"]), hx=getattr(ds, "hx", None))
         self.metrics0 = self.model.metrics([], self.taps())
         self.b_opt.setEnabled(True)
 

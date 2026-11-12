@@ -332,22 +332,55 @@ def crossover_align(Ysub, Ymain, f, fc, xo_kind="linkwitz-riley", order=4, linea
 
 # =============================================================== multi-output profile
 def save_multi_profile(folder, fs, outputs):
-    """outputs: list of dict(name, channel(1-based), paths=[(input_index, h, gain)]).  Writes wavs + profile.json."""
+    """outputs: list of dict(name, channel(1-based), h, paths=[(input_index, gain) | (input_index, gain, h, suffix)]).
+    A 2-tuple path uses the output's own h; a 4-tuple path has its own FIR, written as <name><suffix>.wav
+    (e.g. the MIMO support path from the other source).  Writes wavs + profile.json."""
     os.makedirs(folder, exist_ok=True)
     meta = {"version": 2, "fs": int(fs), "outputs": []}
     for o in outputs:
         fn = f"{o['name']}.wav"
-        wavfile.write(os.path.join(folder, fn), fs, np.asarray(o["h"], np.float32))
-        meta["outputs"].append(dict(name=o["name"], channel=int(o["channel"]),
-                                    paths=[dict(input=int(i), file=fn, gain=float(g)) for i, g in o["paths"]]))
+        if o.get("h") is not None:
+            wavfile.write(os.path.join(folder, fn), fs, np.asarray(o["h"], np.float32))
+        paths = []
+        for pth in o["paths"]:
+            if len(pth) >= 4:
+                i, g, h, suffix = pth[:4]
+                fx = f"{o['name']}{suffix}.wav"
+                wavfile.write(os.path.join(folder, fx), fs, np.asarray(h, np.float32))
+                paths.append(dict(input=int(i), file=fx, gain=float(g)))
+            else:
+                i, g = pth[:2]
+                paths.append(dict(input=int(i), file=fn, gain=float(g)))
+        meta["outputs"].append(dict(name=o["name"], channel=int(o["channel"]), paths=paths))
     json.dump(meta, open(os.path.join(folder, "profile.json"), "w"), indent=1, ensure_ascii=False)
+
+
+def output_peak_gain(outputs, n=1 << 17):
+    """Worst-case linear gain of each output (sum of its paths' magnitude responses), max over outputs."""
+    mx = 0.0
+    for o in outputs:
+        F = 0.0
+        for pth in o["paths"]:
+            h = pth[2] if len(pth) >= 4 else o["h"]
+            F = F + np.abs(rfft(np.asarray(h, float), n)) * float(pth[1])
+        mx = max(mx, float(np.max(F)))
+    return mx
+
+
+def scale_outputs(outputs, sc):
+    for o in outputs:
+        if o.get("h") is not None:
+            o["h"] = o["h"] * sc
+        o["paths"] = [((pth[0], pth[1], pth[2] * sc, pth[3]) if len(pth) >= 4 else pth) for pth in o["paths"]]
+    return outputs
 
 
 def build_bass_system(fs, taps, fc, xo_kind, xo_order, xo_phase, sub_G, main_h, align, sub_trim_db,
                       out_channels, nfft=None):
     """Assemble the output set.
     sub_G: list of (name, G) with G the complex sub response filter on rfftfreq(nfft) (gain, delay, all-pass, EQ ...).
-    main_h: {'L': h, 'R': h} room-correction FIRs (or None -> impulse); align: dict(delay_ms, polarity).
+    main_h: {'L': h, 'R': h} room-correction FIRs (or None -> impulse), optionally with MIMO cross filters
+    'LR' (source L -> speaker R) and 'RL' that get the same high-pass / delay; align: dict(delay_ms, polarity).
     Returns (outputs, info)."""
     nfft = nfft or max(1 << 17, 1 << int(np.ceil(np.log2(taps * 4))))
     f = rfftfreq(nfft, 1 / fs)
@@ -366,9 +399,15 @@ def build_bass_system(fs, taps, fc, xo_kind, xo_order, xo_phase, sub_G, main_h, 
     gd = float(np.mean([group_delay_at(main_h[c], fs, fc) for c in "LR"]))
     pad = max(gd, 0.0)
     outs = []
+    main_filt = hp * lat_ph * np.exp(-2j * np.pi * f * main_delay * 1e-3)
     for c, ch in (("L", out_channels[0]), ("R", out_channels[1])):
-        Hm = rfft(main_h[c], nfft) * hp * lat_ph * np.exp(-2j * np.pi * f * main_delay * 1e-3)
-        outs.append(dict(name=c, channel=ch, h=_fade(irfft(Hm, nfft)[:taps]), paths=[(0 if c == "L" else 1, 1.0)]))
+        Hm = rfft(main_h[c], nfft) * main_filt
+        paths = [(0 if c == "L" else 1, 1.0)]
+        oth = "R" if c == "L" else "L"
+        if main_h.get(oth + c) is not None:                                  # MIMO support path from the other source
+            Hx = rfft(main_h[oth + c], nfft) * main_filt
+            paths.append((0 if oth == "L" else 1, 1.0, _fade(irfft(Hx, nfft)[:taps]), "_from" + oth))
+        outs.append(dict(name=c, channel=ch, h=_fade(irfft(Hm, nfft)[:taps]), paths=paths))
     trim = 10 ** (sub_trim_db / 20) * align["polarity"]
     for n, (name, G) in enumerate(sub_G):
         Hs = G * trim * lp * lat_ph * np.exp(-2j * np.pi * f * (sub_delay * 1e-3 + pad))

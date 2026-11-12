@@ -73,3 +73,22 @@
 - B 鍵在注音輸入法下的實機驗證：離線測試通過，實機因螢幕休眠尚未親眼確認（最後一次重建 01:50 左右）。
 - 3D 瀑布圖在實機的大小／流暢度；一鍵最佳化的結果只在離線預測驗證，尚未用 REW 重新量測。
 - 低音砲功能沒有真實資料可測。
+
+## MIMO 支援喇叭（2026-11-12，雲端 session）
+- 舊版 `Analysis._mimo` 的問題（使用者回報「開 MIMO 後頻響更差」）：它只求解「左＋右總和」在三個量測點平坦（目標振幅 2×、所有位置共用同一個複數目標相位），
+  再把解出的兩條濾波器當成左右各自的校正；單獨看任一喇叭時並沒有被校正，而且 300–510 Hz 用複數混合 SISO 與 MIMO 兩個不相干的解，會產生梳狀凹陷。
+- 新版（Dirac ART 式）：每個來源聲道保留自己的 SISO 濾波器，另一顆喇叭多一條「支援路徑」（ds.hx["LR"]＝左聲道→右喇叭、["RL"]），
+  在每個同時量到 L、R 的位置上以最小平方聯合求解（逐頻點 2×2），目標振幅不超過 SISO 平均已達到的 +3 dB（不硬填共同深谷），
+  增益上限用「逐頻點加大正則化直到合規」而不是裁切。帶寬 `mimo_fmax`（預設 150 Hz，進階設定 60–300）、`mimo_support`（支援強度 0–100%）、
+  `mimo_mode`：space＝空間一致（目標相位沿用 SISO 的相位，只修每個位置的幅度，預設）、decay＝餘音控制（目標為主喇叭直達聲相位，
+  也抵消模態餘音；餘量多耗 3–5 dB，平均曲線可能略差）。
+- 引擎本來就支援任意 input→output 路徑（MatrixConv／Profile outputs）；匯出時多兩個檔 `<slot>_L_fromR.wav`、`<slot>_R_fromL.wav`，
+  設定檔資料夾改存 profile.json（save_multi_profile 支援每條路徑各自的 FIR：path 4-tuple (input, gain, h, suffix)）。
+  試聽／預覽用 MainWindow.design_profile；低音管理 build_bass_system 的 main_h 可含 "LR"/"RL"，交叉路徑套同樣的高通與延遲。
+- 顯示／預測都含支援路徑：Analysis.curves_for、_achieved、per[ch].after／stats（pairs 視窗）、AnalysisPage.ir_for（光譜圖／瀑布圖）、
+  firopt.Model(hx=…)（FIR 工具的預測與評估表）。
+- 測試：`python3 mimo_selftest.py`（合成矩形房間、兩喇叭共用模態、3 個位置；印出 SISO／兩種 MIMO 的每喇叭誤差、位置間差異、餘音）；
+  `QT_QPA_PLATFORM=offscreen python3 mimo_gui_check.py --shots 目錄`（真的跑 MainWindow：分析→開 MIMO→匯出→Profile.from_folder→Engine 卷積，
+  驗證左聲道單獨輸入時右喇叭在 40–120 Hz 有輸出、400 Hz 以上沒有）。合成房間結果（25–300 Hz）：
+  SISO 每喇叭 RMS 7.1 dB／位置間 1.9 dB → 空間一致 6.0／1.5（餘量 −2 dB）→ 餘音控制 5.3／1.1、餘音 −6%（餘量 −5 dB）。
+- 主喇叭目前只在位置 1–3（±30 cm）量測；MIMO 的效益隨位置數與分布增加，若要像 Dirac 一樣，量測流程應讓主喇叭也量 npos 個位置（待辦）。

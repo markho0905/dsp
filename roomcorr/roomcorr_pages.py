@@ -437,26 +437,41 @@ class AnalysisPage(QWidget):
             self.wf.set_data(t, f, Z, -40 if key[3] == "bass" else -35)
 
     def ir_for(self, sel, after):
-        """Impulse response of one matrix cell, optionally convolved with the designed filters."""
+        """Impulse response of one matrix cell, optionally convolved with the designed filters (all paths, so a
+        MIMO design shows the support speaker's contribution too)."""
         from scipy.signal import fftconvolve
         an, ds = self.win.analysis, self.win.design_result
         kind, pos = sel
         m = an.meas
+        l, r = m.get("L", {}).get(pos), m.get("R", {}).get(pos)
+
+        def add(*xs):
+            xs = [x for x in xs if x is not None]
+            n = max(len(x) for x in xs)
+            return sum(np.pad(x, (0, n - len(x))) for x in xs)
+        hx = getattr(ds, "hx", None) or {}
         if kind in ("L", "R"):
-            ir = m.get(kind, {}).get(pos)
+            ir = l if kind == "L" else r
             if ir is None:
                 return None
-            return fftconvolve(ir, ds.h[kind]) if after else np.asarray(ir, float)
-        l, r = m.get("L", {}).get(pos), m.get("R", {}).get(pos)
+            if not after:
+                return np.asarray(ir, float)
+            own = fftconvolve(ir, ds.h[kind])
+            oth = r if kind == "L" else l
+            x = hx.get(kind + ("R" if kind == "L" else "L"))
+            return add(own, fftconvolve(oth, x)) if (x is not None and oth is not None) else own
         if after and l is not None and r is not None:
             a, b = fftconvolve(l, ds.h["L"]), fftconvolve(r, ds.h["R"])
-            n = max(len(a), len(b))
-            return np.pad(a, (0, n - len(a))) + np.pad(b, (0, n - len(b)))
+            parts = [a, b]
+            if "RL" in hx:
+                parts.append(fftconvolve(l, hx["RL"]))
+            if "LR" in hx:
+                parts.append(fftconvolve(r, hx["LR"]))
+            return add(*parts)
         if pos in an.both:
             return np.asarray(an.both[pos], float)
         if l is not None and r is not None:
-            n = max(len(l), len(r))
-            return np.pad(l, (0, n - len(l))) + np.pad(r, (0, n - len(r)))
+            return add(l, r)
         return None
 
 
@@ -581,7 +596,7 @@ class FilterPage(QWidget):
         g.addWidget(self.boost, 4, 0)
         g.addWidget(self.cut, 4, 1)
         c.v.addLayout(g)
-        self.mimo = ToggleBanner("MIMO 聯合校正", "左右聲道與多個量測點一起計算")
+        self.mimo = ToggleBanner("MIMO 聯合校正（支援喇叭）", "低頻由另一顆喇叭發出支援訊號，一起把每個量測點修平（Dirac ART 式）；頻率上限與模式在「進階設定」")
         self.mimo.toggled.connect(lambda v: win.update_setting("mimo", v))
         c.v.addWidget(self.mimo)
         self.keep_bass = ToggleBanner("保留低頻能量", "300 Hz 以下削峰與補谷互相抵銷，低音整體音量不變（關閉＝低頻對齊目標曲線）")

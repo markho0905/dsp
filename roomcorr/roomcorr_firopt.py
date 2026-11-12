@@ -47,20 +47,27 @@ def _biquad_db(kind, fc, q, g, fs, f):
 class Model:
     """Everything the FIR tool needs to draw and optimise quickly, on a log-frequency grid."""
 
-    def __init__(self, an, hbase, tgt_rel, fs, fmax=20000.0, n=480):
+    def __init__(self, an, hbase, tgt_rel, fs, fmax=20000.0, n=480, hx=None):
         self.an, self.fs = an, fs
         self.hbase = {c: np.asarray(hbase[c], float) for c in "LR"}
+        self.hx = {k: np.asarray(v, float) for k, v in (hx or {}).items()}     # MIMO cross filters: "LR", "RL"
         f = an.f
         self.fg = fg = np.geomspace(15.0, min(20000.0, an.fs / 2 * 0.95), n)
         self.fmax = float(fmax)
         self.tgt = np.interp(fg, f, tgt_rel)
         F = {c: rfft(self.hbase[c], an.nfft) for c in "LR"}
+        Fx = {k: rfft(v, an.nfft) for k, v in self.hx.items()}
         self.base, self.spread, self.center = {}, {}, {}
         lat = {c: int(np.argmax(np.abs(self.hbase[c]))) / an.fs for c in "LR"}
         offs = []
         for c in "LR":
-            Hs = np.asarray(an.data[c]["Hs"])
-            P = np.abs(Hs * F[c][None, :]) ** 2
+            oth = "R" if c == "L" else "L"
+            if (c + oth) in Fx and an.pairs:              # source c reaches the listener through both speakers
+                prs = [an.pairs[k] for k in sorted(an.pairs)]
+                P = np.abs(np.stack([q["H" + c] * F[c] + q["H" + oth] * Fx[c + oth] for q in prs])) ** 2
+            else:
+                Hs = np.asarray(an.data[c]["Hs"])
+                P = np.abs(Hs * F[c][None, :]) ** 2
             pm = _box_smooth(f, P.mean(axis=0), 1 / 12)
             self.base[c] = 10 * np.log10(np.interp(fg, f, pm) + TINY)
             dbs = np.array([10 * np.log10(np.interp(fg, f, _box_smooth(f, p, 1 / 6)) + TINY) for p in P])
@@ -74,7 +81,8 @@ class Model:
         if self.has_center:
             cpos = an.center
             for c in "LR":
-                Hc = cpos["H" + c] * F[c]
+                oth = "R" if c == "L" else "L"
+                Hc = cpos["H" + c] * F[c] + (cpos["H" + oth] * Fx[c + oth] if (c + oth) in Fx else 0.0)
                 tau = cpos["tau"] + lat[c]
                 Hc = Hc * np.exp(2j * np.pi * f * tau)  # remove the bulk delay (keeps the L/R difference below)
                 re = np.interp(fg, f, _box_smooth(f, Hc.real, 1 / 48))
@@ -84,12 +92,17 @@ class Model:
             dT = (cpos["dT"] / an.fs) + (lat["R"] - lat["L"])
             self.center["R"] = self.center["R"] * np.exp(-2j * np.pi * fg * dT)
             self.center_ir = {c: an.meas[c][cpos["pos"]] for c in "LR"}
+            self.center_ir_x = {}
+            for c in "LR":                           # source c -> other speaker (MIMO support) at the centre position
+                oth = "R" if c == "L" else "L"
+                if (c + oth) in self.hx:
+                    self.center_ir_x[c] = signal.fftconvolve(an.meas[oth][cpos["pos"]], self.hx[c + oth])
         # modal decay weighting from the predicted (current filter) response at the listening position
         self.decay_w = np.ones(n)
         if self.has_center:
             dw = []
             for c in "LR":
-                ir = signal.fftconvolve(self.center_ir[c], self.hbase[c])
+                ir = self.source_ir(c)
                 t, fw, Z = T.waterfall(ir, an.fs, 15.0, 600.0, tmax=0.4, nslices=21, win=0.3, smooth=1 / 12, nf=200)
                 d = T.decay_times(t, Z, 20.0)
                 d = np.where(np.isnan(d), t[-1], d)
@@ -99,6 +112,15 @@ class Model:
             med = float(np.median(d[lowb])) or 1.0
             self.decay_w = np.where(fg < 500, np.clip(d / med, 1.0, 3.0), 1.0)
             self.decay_ms = d
+
+    def source_ir(self, c):
+        """Predicted IR at the centre for source c through the current filters (own speaker + MIMO support)."""
+        ir = signal.fftconvolve(self.center_ir[c], self.hbase[c])
+        x = getattr(self, "center_ir_x", {}).get(c)
+        if x is not None:
+            n = max(len(ir), len(x))
+            ir = np.pad(ir, (0, n - len(ir))) + np.pad(x, (0, n - len(x)))
+        return ir
 
     # ---- responses
     def chain_H(self, chain, f=None):
@@ -155,7 +177,7 @@ class Model:
             irs = {}
             for c in "LR":
                 hc, _ = D.chain_fir(chain_for(chain, c), self.fs, taps) if chain_for(chain, c) else (np.array([1.0]), 0)
-                irs[c] = signal.fftconvolve(signal.fftconvolve(self.center_ir[c], self.hbase[c]), hc)
+                irs[c] = signal.fftconvolve(self.source_ir(c), hc)
             n = max(len(irs["L"]), len(irs["R"]))
             irsum = sum(np.pad(irs[c], (0, n - len(irs[c]))) for c in "LR")
             md, mx = T.modal_decay(irsum, self.an.fs)
