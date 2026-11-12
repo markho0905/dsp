@@ -30,7 +30,8 @@ SLOTS = [("std", "標準"), ("night", "夜間"), ("movie", "電影")]
 BASE_SETTINGS = dict(preset="平坦", bass=0.0, knee=100.0, tilt=0.0, fmax=5000.0, fmin=25.0, points=None,
                      phase="mixed", taps=16384, out_fs=48000, smooth=1 / 6, max_boost=6.0, max_cut=15.0,
                      mimo=False, decay=False, limit_boost=True, delay_ms=30.0, phase_fmax=400.0, dip=10.0,
-                     pre_ms=30.0, align=False, headroom=1.0, keep_bass=False)
+                     pre_ms=30.0, align=False, headroom=1.0, keep_bass=False, mimo_fmax=150.0, mimo_support=1.0,
+                     mimo_mode="space")
 SLOT_DEFAULTS = {"std": {}, "night": dict(preset="自訂", bass=-3.0, knee=100.0, tilt=-1.0),
                  "movie": dict(preset="低頻增強")}
 
@@ -63,7 +64,9 @@ def params_from_settings(s):
                        pre_ms=float(s["pre_ms"]) if s["pre_ms"] < s["delay_ms"] else None,
                        time_align=bool(s["align"]), target_points=target_points_from(s),
                        smooth_oct=float(s["smooth"]), decay_control=bool(s["decay"]), mimo=bool(s["mimo"]),
-                       keep_bass=bool(s.get("keep_bass", False)))
+                       keep_bass=bool(s.get("keep_bass", False)), mimo_fmax=float(s.get("mimo_fmax", 150.0)),
+                       mimo_support=float(s.get("mimo_support", 1.0)),
+                       mimo_phase=1.0 if s.get("mimo_mode", "space") == "decay" else 0.0)
 
 
 def rt60(ir, fs):
@@ -191,65 +194,160 @@ class Analysis:
         return out
 
     # ---- filter design for the current target / parameters
-    def _mimo(self, p, hs):
-        """MIMO joint correction below ~300 Hz: both speakers solved together over all positions (least squares)."""
+    def _mimo(self, p, hs, info):
+        """MIMO joint correction with support loudspeakers (Dirac ART style), below p.mimo_fmax (default 150 Hz).
+
+        For each source channel (L programme, R programme) the primary speaker keeps its SISO room-correction
+        filter and the *other* speaker gets a support filter.  Both are solved together, per frequency bin, by least
+        squares over every position where L and R were measured:
+
+            sum_m | H_m,p (F_p + w dP) + H_m,s (w S) - D_m |^2  + beta |dP|^2 + (beta + mu) |S|^2
+
+        H_m,p / H_m,s: measured responses of the primary / support speaker at position m (same time origin),
+        F_p: SISO filter, D_m: the target magnitude with the phase of the primary's own direct sound at that
+        position (so stereo timing is kept and the support only cancels what the room adds), w: band weight that
+        fades the whole MIMO contribution out above mimo_fmax.  mu grows as mimo_support shrinks (0..1).
+        p.mimo_phase (from the mimo_mode setting): 0 = "space" - the target keeps the phase the SISO filter already
+        produces, so the support only evens out the level between positions (safe, small headroom cost);
+        1 = "decay" - the target has the primary's direct-sound phase, so the support also cancels the room's
+        modal decay (Dirac ART behaviour; costs more headroom and may leave common dips deeper).
+        Returns (filters per channel, cross filters {"LR": source L -> speaker R, "RL": ...}, used)."""
         prs = [self.pairs[k] for k in sorted(self.pairs)]
         if len(prs) < 2:
-            return hs, False
+            return hs, {}, False
         fs, f, nfft = self.fs, self.f, self.nfft
-        fm = min(float(p.fmax), 300.0)
-        k1 = int(np.searchsorted(f, fm * 1.7)) + 1
+        fm = float(np.clip(getattr(p, "mimo_fmax", 150.0), 40.0, min(float(p.fmax), 300.0)))
+        k1 = int(np.searchsorted(f, fm * 2.0)) + 1
         fk = f[:k1]
-        H = np.stack([[q["HL"][:k1], q["HR"][:k1]] for q in prs])                  # M, 2, K
-        lat = (p.taps // 2 / fs) if getattr(p, "phase_mode", "mixed") == "linear" else p.delay_ms * 1e-3
-        amp = 2 * 10 ** ((self.common + R.target_db(fk, p)) / 20)
-        D = np.tile(amp[None, :] * np.exp(-2j * np.pi * fk[None, :] * (prs[0]["tau"] + lat)), (len(prs), 1))
-        Hk = np.moveaxis(H, 2, 0)
-        Hh = np.conj(np.swapaxes(Hk, 1, 2))
-        A = Hh @ Hk + (0.05 * np.mean(np.abs(Hk) ** 2, axis=(1, 2)))[:, None, None] * np.eye(2)
-        W = np.linalg.solve(A, Hh @ D.T[:, :, None])[:, :, 0]                      # K, 2
         w = R.band_weight(fk, p.fmin, fm, 0.5, 0.75)
-        out = {}
-        for j, ch in enumerate("LR"):
-            Fs = rfft(hs[ch], nfft)
-            ref = np.median(np.abs(Fs[:k1][(fk >= p.fmin) & (fk <= fm)]))
-            Wj = W[:, j] * np.minimum(1.0, 10 ** ((p.max_boost + 3) / 20) * ref / (np.abs(W[:, j]) + TINY))
-            Fn = Fs.copy()
-            Fn[:k1] = w * Wj + (1 - w) * Fs[:k1]
-            h = np.fft.irfft(Fn, nfft)[:p.taps]
+        lat = (p.taps // 2 / fs) if getattr(p, "phase_mode", "mixed") == "linear" else p.delay_ms * 1e-3
+        strength = float(np.clip(getattr(p, "mimo_support", 1.0), 0.0, 1.0))
+        H = {c: np.stack([q["H" + c][:k1] for q in prs]) for c in "LR"}              # M x K
+        F = {c: rfft(hs[c], nfft) for c in "LR"}
+        energy = np.mean(np.abs(H["L"]) ** 2 + np.abs(H["R"]) ** 2, axis=0) / 2 + TINY
+        beta = float(getattr(p, "mimo_beta", 0.05)) * energy
+        mu = beta * 20.0 * ((1.0 - strength) / max(strength, 0.05)) ** 2 if strength < 1.0 else 0.0
+        if strength <= 0.0:
+            mu = beta * 1e6
+        band = (fk >= p.fmin) & (fk <= fm)
+        mid = (f >= 300) & (f <= 3000)
+        out_h, out_x = {}, {}
+        for src in "LR":
+            oth = "R" if src == "L" else "L"
+            Fp = F[src][:k1]
+            own = H[src] * Fp[None, :]                                           # what the SISO filter achieves
+            # direct-sound arrival of the primary speaker at each position (inside the pair window)
+            tau = np.array([q["tau"] + max(0, (-q["dT"] if src == "L" else q["dT"])) / fs for q in prs])
+            # target magnitude: the curve target, but never more than ~3 dB above what the SISO design already
+            # reaches on average (dips it chose not to fill stay unfilled; per-position nulls can still be filled)
+            avg_db = 10 * np.log10(R.oct_smooth(np.mean(np.abs(own) ** 2, axis=0), 1 / 6) + TINY)
+            amp = 10 ** (np.minimum(info[src]["tgt"][:k1], avg_db + 3.0) / 20)
+            # target phase: the primary's own direct sound inside the MIMO band, blending into the phase the SISO
+            # filter already produces where the band fades out (no complex blend of two unrelated solutions)
+            u_direct = np.exp(-2j * np.pi * fk[None, :] * (tau[:, None] + lat))
+            u_own = own / (np.abs(own) + TINY)
+            rho = float(np.clip(getattr(p, "mimo_phase", 1.0), 0.0, 1.0))   # 1 = direct-sound phase (decay control)
+            u = (w * rho)[None, :] * u_direct + (1 - w * rho)[None, :] * u_own
+            u = u / (np.abs(u) + TINY)
+            D = amp[None, :] * u
+            resid = D - own
+            Ap, As = w[None, :] * H[src], w[None, :] * H[oth]
+            a11_0 = np.sum(np.abs(Ap) ** 2, axis=0)
+            a22_0 = np.sum(np.abs(As) ** 2, axis=0)
+            a12 = np.sum(np.conj(Ap) * As, axis=0)
+            b1 = np.sum(np.conj(Ap) * resid, axis=0)
+            b2 = np.sum(np.conj(As) * resid, axis=0)
+            # gain limits relative to the SISO filter: primary up to 2 dB over its own peak, support up to that peak.
+            # Instead of clipping the solution (which breaks the cancellation pattern), the regularisation of a bin
+            # is raised until its solution respects the limits, so it shrinks smoothly back towards the SISO filter.
+            g_mid = float(np.median(np.abs(F[src][mid]))) + TINY
+            pk = max(float(np.abs(Fp[band]).max()) if band.any() else g_mid, g_mid * 10 ** (p.max_boost / 20))
+            lim_p, lim_s = pk * 10 ** (2.0 / 20), pk
+            prim_pen = 0.0 if getattr(p, "mimo_primary", True) else beta * 1e6
+            scale_k = np.ones(k1)
+            for _ in range(24):
+                a11 = a11_0 + beta * scale_k + prim_pen
+                a22 = a22_0 + (beta + mu) * scale_k
+                det = a11 * a22 - np.abs(a12) ** 2 + TINY
+                dP = (a22 * b1 - a12 * b2) / det
+                S = (a11 * b2 - np.conj(a12) * b1) / det
+                Wp, Ws = Fp + w * dP, w * S
+                bad = (np.abs(Wp) > lim_p) | (np.abs(Ws) > lim_s)
+                if not bad.any():
+                    break
+                scale_k = np.where(bad, scale_k * 2.0, scale_k)
+            Wp = Wp * np.minimum(1.0, lim_p / (np.abs(Wp) + TINY))        # safety only; normally inactive now
+            Ws = Ws * np.minimum(1.0, lim_s / (np.abs(Ws) + TINY))
             k = p.taps // 5
-            h[-k:] *= 0.5 + 0.5 * np.cos(np.pi * np.arange(k) / k)
-            out[ch] = h
-        return out, True
+            fade = 0.5 + 0.5 * np.cos(np.pi * np.arange(k) / k)
+            Fn = F[src].copy()
+            Fn[:k1] = Wp
+            h = np.fft.irfft(Fn, nfft)[:p.taps]
+            h[-k:] *= fade
+            out_h[src] = h
+            Fx = np.zeros_like(Fn)
+            Fx[:k1] = Ws
+            hx = np.fft.irfft(Fx, nfft)[:p.taps]
+            hx[-k:] *= fade
+            out_x[src + oth] = hx
+        self.mimo_band = (float(p.fmin), fm)
+        return out_h, out_x, True
+
+    def _achieved(self, pos, Ft, Fx):
+        """Complex response at one measured position for source L, source R and L+R programme (all paths)."""
+        q = self.pairs.get(pos)
+        if q is None:
+            return None
+        xLR = Fx.get("LR", 0.0)
+        xRL = Fx.get("RL", 0.0)
+        aL = q["HL"] * Ft["L"] + q["HR"] * xLR
+        aR = q["HR"] * Ft["R"] + q["HL"] * xRL
+        return {"L": aL, "R": aR, "LR": aL + aR}
+
+    @staticmethod
+    def _band_stats(f, w, before, after, tgt, lo, hi):
+        """Same numbers as roomcorr.band_report, from per-position complex spectra (M x K) before/after."""
+        sel = (f >= lo) & (f <= hi)
+
+        def stat(Hs):
+            db = np.array([10 * np.log10(R.oct_smooth(np.abs(H) ** 2, w) + TINY) for H in Hs])
+            avg = 10 * np.log10(R.oct_smooth(np.mean(np.abs(Hs) ** 2, axis=0), w) + TINY)
+            e_avg = np.sqrt(np.mean((avg - tgt)[sel] ** 2))
+            e_pos = np.mean([np.sqrt(np.mean((x - tgt)[sel] ** 2)) for x in db])
+            return e_avg, e_pos
+        return stat(before), stat(after)
 
     def curves_for(self, ds, kind, pos):
         """(before, after) in dB relative to the mid-band level for one cell of the measurement matrix."""
         f = self.f
+        Fx = getattr(ds, "Fx", {}) or {}
         if kind in ("L", "R"):
             d = self.data[kind]
             if pos not in d["pos"]:
                 return None
             H = d["Hs"][d["pos"].index(pos)]
-            b, a = self.sm(H), self.sm(H * ds.Ft[kind])
+            b = self.sm(H)
+            ach = self._achieved(pos, ds.Ft, Fx) if Fx else None
+            a = self.sm(ach[kind]) if ach is not None else self.sm(H * ds.Ft[kind])
             ref = self.common
         else:
             q = self.pairs.get(pos)
             if q is None:
                 return None
             b = self.sm(q["HB"] if "HB" in q else q["HL"] + q["HR"])
-            a = self.sm(q["HL"] * ds.Ft["L"] + q["HR"] * ds.Ft["R"])
+            a = self.sm(self._achieved(pos, ds.Ft, Fx)["LR"])
             ref = float(b[(f >= 300) & (f <= 3000)].mean())
             a = a - float(a[(f >= 300) & (f <= 3000)].mean()) + 0.0
         return b - ref, a - ref if kind in ("L", "R") else a
 
     def design(self, p):
         fs, f, nfft = self.fs, self.f, self.nfft
-        hs, info, Ft = {}, {}, {}
+        hs, info, Ft, hx, Fx = {}, {}, {}, {}, {}
         for ch in "LR":
             hs[ch], info[ch] = R.design_filter(f, self.data[ch], fs, nfft, p, self.common)
         mimo_used = False
         if getattr(p, "mimo", False):
-            hs, mimo_used = self._mimo(p, hs)
+            hs, hx, mimo_used = self._mimo(p, hs, info)
         shift = {"L": 0, "R": 0}
         if p.time_align and self.center:
             dT = self.center["dT"]
@@ -261,30 +359,71 @@ class Analysis:
             if shift[ch]:
                 hs[ch] = np.concatenate([np.zeros(shift[ch]), hs[ch]])[:p.taps]
             Ft[ch] = rfft(hs[ch], nfft)
+        for key in list(hx):                     # cross filters carry the time alignment of their *source* channel
+            if shift[key[0]]:
+                hx[key] = np.concatenate([np.zeros(shift[key[0]]), hx[key]])[:p.taps]
+            Fx[key] = rfft(hx[key], nfft)
         band = (f >= 20) & (f <= 20000)
-        gmax = max(np.abs(Ft[c][band]).max() for c in "LR")
+        peak = {}
+        for ch in "LR":                          # per speaker output: own path alone, or own + cross path for mono content
+            oth = "R" if ch == "L" else "L"
+            x = Fx[oth + ch][band] if (oth + ch) in Fx else 0.0
+            peak[ch] = np.maximum(np.abs(Ft[ch][band]), np.abs(Ft[ch][band] + x))
+        gmax = max(float(peak[c].max()) for c in "LR")
         scale = min(1.0, 10 ** (-p.headroom / 20) / gmax)
         tgt_rel = R.target_db(f, p)
         per = {}
+        prs = sorted(self.pairs)
         for ch in "LR":
             d = self.data[ch]
-            after = 10 * np.log10(R.oct_smooth(np.mean(np.abs(d["Hs"]) ** 2, axis=0) * np.abs(Ft[ch]) ** 2, d["w"]) + TINY)
+            if mimo_used and prs:
+                before = np.stack([self.pairs[q]["H" + ch] for q in prs])
+                after_c = np.stack([self._achieved(q, Ft, Fx)[ch] for q in prs])
+                after = 10 * np.log10(R.oct_smooth(np.mean(np.abs(after_c) ** 2, axis=0), d["w"]) + TINY)
+                st_lo = self._band_stats(f, d["w"], before, after_c, info[ch]["tgt"], p.fmin, 300)
+                st_hi = self._band_stats(f, d["w"], before, after_c, info[ch]["tgt"], 300, p.fmax)
+            else:
+                after = 10 * np.log10(R.oct_smooth(np.mean(np.abs(d["Hs"]) ** 2, axis=0) * np.abs(Ft[ch]) ** 2, d["w"]) + TINY)
+                st_lo = R.band_report(f, d, Ft[ch], info[ch]["tgt"], p.fmin, 300)
+                st_hi = R.band_report(f, d, Ft[ch], info[ch]["tgt"], 300, p.fmax)
             per[ch] = dict(before=d["M"] - self.common, after=after - self.common,
-                           stats_lo=R.band_report(f, d, Ft[ch], info[ch]["tgt"], p.fmin, 300),
-                           stats_hi=R.band_report(f, d, Ft[ch], info[ch]["tgt"], 300, p.fmax),
-                           loss=info[ch]["loss"])
+                           stats_lo=st_lo, stats_hi=st_hi, loss=info[ch]["loss"])
         comb = None
         if self.center:
             c = self.center
             before = self.sm(c["HL"] + c["HR"])
             sel = (f >= p.ref_band[0]) & (f <= p.ref_band[1])
             ref_c = float(before[sel].mean())
-            comb = dict(before=before - ref_c, after=self.sm(c["HL"] * Ft["L"] + c["HR"] * Ft["R"]) - ref_c)
+            comb = dict(before=before - ref_c, after=self.sm(self._achieved(c["pos"], Ft, Fx)["LR"]) - ref_c)
             comb["after"] = comb["after"] - (comb["after"][sel].mean())      # show relative to its own mid-band level
             if "HB" in c:
                 comb["measured"] = self.sm(c["HB"]) - float(self.sm(c["HB"])[sel].mean())
-        return SimpleNamespace(h={c: hs[c] * scale for c in "LR"}, scale=scale, shift=shift, per=per, comb=comb,
-                               tgt_rel=tgt_rel, params=p, Ft=Ft, mimo_used=mimo_used, info=info)
+        mimo_stats = self._mimo_stats(p, Ft, Fx) if mimo_used else None
+        return SimpleNamespace(h={c: hs[c] * scale for c in "LR"}, hx={k: v * scale for k, v in hx.items()},
+                               scale=scale, shift=shift, per=per, comb=comb, tgt_rel=tgt_rel, params=p, Ft=Ft, Fx=Fx,
+                               mimo_used=mimo_used, mimo_stats=mimo_stats, info=info)
+
+    def _mimo_stats(self, p, Ft, Fx):
+        """Spread across positions (dB) in the MIMO band and predicted modal decay at the centre: SISO-only part vs
+        with support paths.  Used for the design report."""
+        f = self.f
+        lo, hi = getattr(self, "mimo_band", (p.fmin, 150.0))
+        sel = (f >= lo) & (f <= hi)
+        prs = sorted(self.pairs)
+        if len(prs) < 2:
+            return None
+        out = {}
+        for src in "LR":
+            own = np.stack([self.pairs[q]["H" + src] * Ft[src] for q in prs])
+            full = np.stack([self._achieved(q, Ft, Fx)[src] for q in prs])
+
+            def spread(Hs):
+                db = np.array([10 * np.log10(R.oct_smooth(np.abs(H) ** 2, 1 / 6) + TINY) for H in Hs])
+                return float(db[:, sel].std(axis=0).mean())
+            out["spread_" + src] = (spread(own), spread(full))
+        sup = {k: 20 * np.log10(np.abs(v[sel]).max() / (np.abs(Ft[k[0]][sel]).max() + TINY) + TINY) for k, v in Fx.items()}
+        out["support_db"] = sup
+        return out
 
     def design_text(self, ds):
         p = ds.params
@@ -300,8 +439,19 @@ class Analysis:
         if getattr(p, "keep_bass", False):
             out.append(f"低頻音量基準：保留原本低頻能量（目標在 300 Hz 以下平移 左 {bo[0]:+.1f}、右 {bo[1]:+.1f} dB，"
                        "削峰與補谷在低頻互相抵銷，整體低音量不變）")
+        if getattr(ds, "mimo_used", False):
+            lo, hi = getattr(self, "mimo_band", (p.fmin, 150.0))
+            ms = getattr(ds, "mimo_stats", None) or {}
+            sp = [ms.get("spread_" + c) for c in "LR"]
+            sup = ms.get("support_db", {})
+            mode = "餘音控制" if getattr(p, "mimo_phase", 0.0) >= 0.5 else "空間一致"
+            txt = (f"MIMO 支援喇叭（{lo:.0f}–{hi:.0f} Hz，{mode}）：左聲道由右喇叭支援（最大 {sup.get('LR', 0):+.0f} dB）、"
+                   f"右聲道由左喇叭支援（最大 {sup.get('RL', 0):+.0f} dB）")
+            if all(sp):
+                txt += f"；位置間差異 左 {sp[0][0]:.1f} → {sp[0][1]:.1f} dB、右 {sp[1][0]:.1f} → {sp[1][1]:.1f} dB（只用自己的濾波器 → 加上支援）"
+            out.append(txt)
         out.append(f"濾波器整體增益 {20 * np.log10(ds.scale):.1f} dB；延遲約 {lat:.0f} ms"
-                   + ("；已啟用 MIMO 聯合校正（300 Hz 以下）" if getattr(ds, "mimo_used", False) else "")
+                   + ("；已啟用 MIMO 聯合校正" if getattr(ds, "mimo_used", False) else "")
                    + (f"；時間對齊：延遲{'左' if ds.shift['L'] else '右'}聲道 "
                       f"{max(ds.shift.values()) / self.fs * 1000:.2f} ms" if any(ds.shift.values()) else ""))
         return out
@@ -357,7 +507,8 @@ def auto_settings(an, settings, conservative=0.5, progress=None):
     align = bool(an.center and abs(an.center["dT"]) / an.fs * 1000 > 0.15)
     boost = float(np.interp(conservative, [0, 1], [8, 4]))
     s.update(fmin=fmin, fmax=fmax, max_boost=round(boost, 1), limit_boost=True, dip=10.0, phase="mixed",
-             phase_fmax=400.0, decay=True, mimo=False, align=align, bass=0.0, tilt=0.0, knee=100.0)
+             phase_fmax=400.0, decay=True, mimo=bool(settings.get("mimo", False)), align=align, bass=0.0, tilt=0.0,
+             knee=100.0)
     if s.get("preset") in ("平坦", "自訂") and not s.get("points"):
         s["preset"], s["points"] = "自訂", [list(p) for p in AUTO_TARGET]
     # --- candidate search: how much to cut, how fine to follow the curve
